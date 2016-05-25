@@ -1,12 +1,16 @@
 from qgis.core import *
 import qgis.utils
-#import ipdb
+import ipdb
 import datetime
 import urllib2
 import numpy as np
 import matplotlib
-#matplotlib.use('Agg',warn=False)
+matplotlib.use('Agg') # Workaround for Tkinter import error
 import matplotlib.pyplot as plt
+import json
+import sys
+import collections
+import math
 
 '''
 This code's goal is to create an accurate model of biking traffic from Strava
@@ -141,12 +145,62 @@ def getFieldNames(layer):
     field_names = [field.name() for field in layer.pendingFields()]
     return field_names
 
-def plotEdges(edge_layer):
-    x = []
-    y = []
-    idxx1 = edge_layer.fieldNameIndex('X1')
-    idxx2 = edge_layer.fieldNameIndex('X2')
-    idxy1 = edge_layer.fieldNameIndex('Y1')
+def getMinDist(x1,y1,x2,y2,x0,y0):
+
+    if x2 == x1:
+        # horizontal segment
+        x = x1
+        y = y0
+    elif y1==y2:
+        # vertical segment
+        x = x0
+        y = y1
+    else:
+        # the equation of the edge's line
+        m1 = (y2-y1)/(x2-x1)
+        b1 = y1 - m1*x1
+
+        # the equation of the perpendicular line that passes through the specified point
+        m2 = -1.0/m1
+        b2 = y0 - m2*x0
+
+        # the coordinates of intersection
+        x = (b2-b1)/(m1-m2)
+        y = m1*x+b1
+
+    # must be closest to the segment, not the line
+    if x1 > x2: # can't assume x1 < x2
+        if x > x1: x = x1
+        if x < x2: x = x2
+    else:
+        if x < x1: x = x1
+        if x > x2: x = x2
+    if y1 > y2: # can't assume y1 < y2
+        if y > y1: y = y1
+        if y < y2: y = y2
+    else:
+        if y < y1: y = y1
+        if y > y2: y = y2
+
+    # closest approach is the distance from the perpendicular line
+    # angular separation in radians * r_earth = distance
+    r_earth = 6.3781e6
+    mindist = math.acos(math.sin(y0*math.pi/180.0)*math.sin(y*math.pi/180.0)+math.cos(y0*math.pi/180.0)*math.cos(y*math.pi/180.0)*math.cos((x0-x)*math.pi/180.0))*r_earth
+
+    return mindist
+
+def plotEdges(edge_layer,lat=None,lon=None,radius=None, edgeids=None):
+
+    x = [] # Longitude (deg E)
+    y = [] # Latitude (deg N)
+
+    xclose = []
+    yclose = []
+    streetname = []
+    
+    idxx1 = edge_layer.fieldNameIndex('X1') 
+    idxx2 = edge_layer.fieldNameIndex('X2') 
+    idxy1 = edge_layer.fieldNameIndex('Y1') 
     idxy2 = edge_layer.fieldNameIndex('Y2')
 
     for feature in edge_layer.getFeatures():
@@ -157,11 +211,51 @@ def plotEdges(edge_layer):
         y.append(feature[idxy2])
         y.append(None)
 
-    fig = plt.figure()
-#    ax = fig.add_subplot(121)
-    plt.plot(x, y)
-    plt.savefig('edge.png')
+        
+        
+        if lat != None and lon != None:
+            if radius != None:
+                mindist = getMinDist(feature[idxx1],feature[idxy1],feature[idxx2],feature[idxy2],lon,lat)
+                if mindist <= radius:
+                    xclose.append(feature[idxx1])
+                    xclose.append(feature[idxx2])
+                    xclose.append(None)
+                    yclose.append(feature[idxy1])
+                    yclose.append(feature[idxy2])
+                    yclose.append(None)
+                    edgeid = feature[0]
+                    streetname = feature[2]
+        if feature[0] in edgeids:
+            xclose.append(feature[idxx1])
+            xclose.append(feature[idxx2])
+            xclose.append(None)
+            yclose.append(feature[idxy1])
+            yclose.append(feature[idxy2])
+            yclose.append(None)
+            streetname.append(feature[2])
+            
 
+    lon = xclose[0]
+    lat = yclose[0]
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.set_xlabel("Longitude (deg E)")
+    ax.set_ylabel("Latitude (deg N)")
+
+    y_formatter = matplotlib.ticker.ScalarFormatter(useOffset=False)
+    ax.yaxis.set_major_formatter(y_formatter)
+    ax.xaxis.set_major_formatter(y_formatter)
+    size = 0.005
+#    ax.set_ylim([lat-size,lat+size])
+#    ax.set_xlim([lon-size,lon+size])
+    
+    
+    plt.plot(x, y)
+    plt.plot(xclose, yclose, 'r-')
+#    plt.plot(lon,lat,'ro')
+#    ax.annotate('E 79th St @ Park Ave (' + str(edgeid) + ')',xy=(lon+0.0001,lat))
+#    ax.annotate(streetname + '(' + str(edgeid) + ')',xy=(lon+0.0001,lat))
+    plt.savefig('edge.png')
 
 # supply path to qgis install location
 QgsApplication.setPrefixPath("C:/OSGeo4W64", True)
@@ -195,7 +289,37 @@ if not data_layer.isValid():
   print "data layer failed to load!"
 else: QgsMapLayerRegistry.instance().addMapLayer(data_layer)  
 
-print getFieldNames(data_layer)
+    
+                    
+    
+
+
+#print getFieldNames(data_layer)
+#print getFieldNames(edge_layer)
+
+# E 79th & Park Ave
+lat = 40.775578
+lon = -73.960339
+
+# Manhattan Bridge Bikepath
+#lat = 40.714629
+#lon = -73.994544
+
+#plotEdges(edge_layer, edgeid=1134166)# lat=lat, lon=lon, radius=2.5)
+#plotEdges(edge_layer, edgeid=803175)
+#plotEdges(edge_layer, edgeid=54068)
+#plotEdges(edge_layer, lat=lat, lon=lon, radius=2.5)
+plotEdges(edge_layer, edgeids=[1134166,803175,54068,54853])# lat=lat, lon=lon, radius=2.5)
+
+with open('weather.lga.csv','w') as weatherfile:
+    for i in range(8):
+        weather = getWeather(datetime.datetime(2015,7,13) + datetime.timedelta(days=float(i)),airport='LGA')
+#    ipdb.set_trace()
+        for time, temperature, humidity, precipitation in zip(weather['time'],weather['temperature'],weather['humidity'],weather['precipitation']):
+                if precipitation == 'N/A': precipitation = 0.0
+                weatherfile.write(str(time) + ',' + str(temperature) + ',' + str(humidity) + ',' + str(precipitation) + '\n')
+#ipdb.set_trace()
+    
 
 # grab the indices of relevant fields
 idxYear = data_layer.fieldNameIndex('YEAR')
@@ -204,19 +328,55 @@ idxHour = data_layer.fieldNameIndex('HOUR')
 idxMin = data_layer.fieldNameIndex('MINUTE')
 idxCommuters = data_layer.fieldNameIndex('COMMUTE_CO')
 idxEdge = data_layer.fieldNameIndex('EDGE_ID')
+idxx1 = edge_layer.fieldNameIndex('X1') 
+idxx2 = edge_layer.fieldNameIndex('X2') 
+idxy1 = edge_layer.fieldNameIndex('Y1') 
+idxy2 = edge_layer.fieldNameIndex('Y2')
 
+# create a dictionary of edges for later reference
+edges = {}
+for feature in edge_layer.getFeatures():
+    edges[feature[0]] = {'x':[feature[idxx1],feature[idxx2]],
+                         'y':[feature[idxy1],feature[idxy2]]}
 
+# make an animated gif of bicycle traffic
+#for i in range(0,24*7):
+for i in range(0,24*7*60):
+#    date1 = datetime.datetime(2015,7,13) + datetime.timedelta(hours=float(i))
+#    date2 = datetime.datetime(2015,7,13) + datetime.timedelta(hours=float(i)+1.0)
+    date1 = datetime.datetime(2015,7,13) + datetime.timedelta(minutes=float(i))
+    date2 = datetime.datetime(2015,7,13) + datetime.timedelta(minutes=float(i)+1.0)
 
-plotEdges(edge_layer)
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.set_xlabel("Longitude (deg E)")
+    ax.set_ylabel("Latitude (deg N)")
+    ax.set_title(str(date1))
 
-sys.exit()
-#ipdb.set_trace()
+    y_formatter = matplotlib.ticker.ScalarFormatter(useOffset=False)
+    ax.yaxis.set_major_formatter(y_formatter)
+    ax.xaxis.set_major_formatter(y_formatter)
+    ax.set_ylim([40.67,40.90])
+    ax.set_xlim([-74.03,-73.90])
+    for feature in data_layer.getFeatures():
+        # convert strava time (local time) to datetime object 
+        date = datetime.datetime(feature[idxYear],1,1,feature[idxHour],feature[idxMin]) +\
+               datetime.timedelta(days=feature[idxDay]-1)
+        if date >= date1 and date < date2:
+            edgeid = feature[idxEdge]
+            x = edges[edgeid]['x']
+            y = edges[edgeid]['y']
+#            alpha = min([float(feature[idxCommuters])*0.1,1])
+            alpha = min([float(feature[idxCommuters])*0.3,1])
+            plt.plot(x, y, 'b-', alpha=alpha)
 
-#ipdb.set_trace()
-commuters = {}
+    plt.savefig("minutegif/" + datetime.datetime.strftime(date1,'%Y-%m-%dT%H%M%S') + '.png') 
+    plt.close()
+    
+ipdb.set_trace()
+commuters = collections.OrderedDict()
 i=0
 bad = 0
-
 for i in range(24*7):
     date = datetime.datetime(2015,7,13) + datetime.timedelta(hours=float(i))
     commuters[str(date)] = 0
@@ -231,7 +391,12 @@ for feature in data_layer.getFeatures():
 
     # filter out dates that aren't supposed to be in the sample (not complete)
     if date >= datetime.datetime(2015,7,20): bad += 1
-    else: commuters[datestr] += feature[idxCommuters]
+    else:
+#        if feature[idxEdge] == 1134166: # Manhattan Bridge Bikepath
+#        if feature[idxEdge] == 54853: # Random spot
+#        if feature[idxEdge] == 803175: # spot with 43 total weekly commuters; roughly scales to busiest by total population
+        if feature[idxEdge] == 54068: # spot with 122 total weekly commuters; roughly scales to busiest by population density
+            commuters[datestr] += feature[idxCommuters]
         
 #    print feature[idxEdge], date, feature[idxCommuters]
 #    if str(date) in commuters.keys(): commuters[str(date)] += feature[idxCommuters]
@@ -241,11 +406,27 @@ for feature in data_layer.getFeatures():
     i += 1
     if i % 10000 == 0: print float(i)#/float(nfeatures)
 
-    
+with open('commuters.hour.4@E14.csv','w') as commuterfile:
+    for key in commuters.keys():
+        commuterfile.write(key + ',' + str(commuters[key]) + '\n')
+
+ipdb.set_trace()
+
+edgeCommuters = collections.OrderedDict()
+for feature in edge_layer.getFeatures():
+    edgeCommuters[feature[0]] = 0
+
+for feature in data_layer.getFeatures():
+    edgeCommuters[feature[0]] += feature[idxCommuters]
+
+with open('edgecommuters.csv','w') as commuterfile:
+    for key in edgeCommuters.keys():
+        commuterfile.write(str(key) + ',' + str(edgeCommuters[key]) + '\n')
+
 
 #weather = getWeather(datetime.datetime(2015,7,13), airport='JFK')
-print bad
-#ipdb.set_trace()
+#print bad
+ipdb.set_trace()
 
 # When your script is complete, call exitQgis() to remove the provider and
 # layer registries from memory
