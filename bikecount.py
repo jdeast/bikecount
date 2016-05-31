@@ -11,99 +11,44 @@ import json
 import sys
 import collections
 import math
+import urllib2
+import matplotlib.dates as mdates
+import csv
+import numpy as np
+import emcee
+import corner
 
-'''
-This code's goal is to create an accurate model of biking traffic from Strava
-data, both for differential measurements and absolute measurements calibrated
-by some other independent, accurate measurement of biking. 
+def updateData():
+    key = "1uZ4_bSXdB188mBj8PVJL4fGErOeOyN1g5OR8_ZLdAlk"
+    gid = "1919569404"
+    response = urllib2.urlopen("https://docs.google.com/spreadsheet/ccc?key=" + key + "&output=csv", timeout = 5)
+    countdata = response.read().split('\r\n')
+    response = urllib2.urlopen("https://docs.google.com/spreadsheet/ccc?key=" + key + "&gid=" + gid + "&output=csv", timeout = 5)
+    locationdata = response.read().split('\r\n')
+    f = open( "count.csv", 'w' )
+    f.write( '\n'.join(countdata))
+    f.close()
+    f = open( "location.csv", 'w' )
+    f.write( '\n'.join(locationdata))
+    f.close()
 
-Strava differential measurements:
+def readcsv(csvname):
+    # read the CSV file into a dictionary
+    f = open(csvname, 'rb')
+    reader = csv.reader(f)
+    headers = reader.next()
+    values = {}
+    for h in headers:
+        values[h] = []
+    for row in reader:
+        for h, v in zip(headers, row):
+            values[h].append(v)    
+    return values
 
-Assumes general population or at least trends are well described by Strava users
-
-  1) Ridership by time of day
-  2) Ridership by day of week
-  3) Ridership by season
-      - degeneracy between trends in Strava usage and trends in biking make
-        this (and longer timescale analysis) suspect
-  4) Ridership by weather
-      - rain, snow, temperature, wind
-  5) Ridership by location
-      - can do for free with heatmap, qualitatively
-  6) Ridership by age/gender
-      - biased and ~uncorrectable
-
-Strava absolute calibration:
-
-Strava is marketed toward "hardcore" athletes and competitors -- not daily
-commuters. A smart phone with a data plan (or similar, expensive, luxury,
-techy gadget) is required. This likely biases the Strava data toward more
-extreme behavior -- relatively higher usage in bad weather, on trails, on hills,
-and also among more affluent, likely younger and male bikers. The popularity
-of Strava, and the interest of its users to log their rides may wax and wane,
-confusing efforts. The magnitude of these biases are likely regional, hyper
-local, and condition dependent, but can be corrected for with independent,
-calibrating data.
-
-Potential confounding variables
-  1) Weather
-  2) Location
-      - location type
-          - trails, roads, rural, urban
-      - radius of applicability
-          - trends in Europe are not the same as US
-              - and likely more local (distance from bike path?)
-  3) Linear Time
-      - increased/decreased strava usage
-      - logging habits
-  4) Time of day
-      - Recreational hours vs commuting hours
-  5) Time of year
-  6) Grade
-  7) Age
-      - difficult to correct
-  8) Gender
-      - hard to correct
-          - automated bike counters cannot differentiate
-          - even manual bike counts are error prone
-
-
-The quality of the calibration will depend critically on the spatial and temporal
-frequency of bike counts to calibrate the data and the applicability of the model.
-We do not require uniform, annual, or simultaneous bike counts. Any data point at
-any time can be used to anchor the Strava data. The more varied the conditions,
-the more accurate it will be. Can we set up a year round submission of bike count
-data? Need to vet data. Install some of these?
-http://bikeportland.org/2015/01/13/50-device-change-bike-planning-forever-130891
-They would make excellent anchor points, particularly to calibrate the changes
-in Strava user behavior over time.
-
-Advantages to accurate ridership statistics
-  1) determine what infrastructure improvements are most effective
-  2) immediately measure the effacacy of infrastructure improvements
-      - At least in terms of ridership
-  3) determine if an accident is indicative of a dangerous intersection
-      - Or is accident rate consistent with ridership rates?
-  4) Determine where bike counts would be most effective
-
-Other issues:
-  1) Correlated errors
-      - lots of data from one user could skew error estimates
-      - non-Poisson distribution of bikers
-          - bikers in groups
-  2) Low number statistics
-      - How many Strava users?
-  3) Errors in bike counts
-
-See here for a python cookbook for pyqgis:
-http://spatialgalaxy.net/2014/10/09/a-quick-guide-to-getting-started-with-pyqgis-on-windows/
-https://trac.osgeo.org/osgeo4w/
-http://docs.qgis.org/testing/en/docs/pyqgis_developer_cookbook/raster.html
-
-'''
 
 # get the weather for a given day by airport code (is it international?)
-def getWeather(date, airport='BOS', timezone=5):
+#def getWeather(date, airport='BOS', timezone=5):
+def getWeather(date, airport='BED', timezone=5):
 
     # https://www.wunderground.com/history/airport/BOS/2015/10/8/DailyHistory.html?&format=1
     url = 'https://www.wunderground.com/history/airport/' + airport + '/' +\
@@ -140,296 +85,325 @@ def getWeather(date, airport='BOS', timezone=5):
             weather['conditions'].append(valarr[11])
     return weather   
 
-# get the field names of a given layer:
-def getFieldNames(layer):
-    field_names = [field.name() for field in layer.pendingFields()]
-    return field_names
+# calculate the likelihood of a given set of parameters given the data
+def bikelike(pars, data, bikers=None, plot=False):
 
-def getMinDist(x1,y1,x2,y2,x0,y0):
+    # Bike count model:
+    # bikers(location,time) = zeropoint(location)*(c0*temperature(time) + c1*humidity(time) + c2*rain(time))
+    # pars[0] = coeff_temp
+    # pars[1] = coeff_humidity
+    # pars[2] = coeff_rain
+    # pars[3:] = zeropoints
 
-    if x2 == x1:
-        # horizontal segment
-        x = x1
-        y = y0
-    elif y1==y2:
-        # vertical segment
-        x = x0
-        y = y1
-    else:
-        # the equation of the edge's line
-        m1 = (y2-y1)/(x2-x1)
-        b1 = y1 - m1*x1
+    locations = list(set(data['Location']))
+#    if len(locations)+3 != len(pars):
+    if len(locations)+2 != len(pars):
+        print "Parameter array does not match data; exiting"
+        sys.exit()
 
-        # the equation of the perpendicular line that passes through the specified point
-        m2 = -1.0/m1
-        b2 = y0 - m2*x0
+    locations.sort()
+    nlocations = len(locations)
+    bikers = np.zeros(len(data['Location']))
+    residuals = np.zeros(len(data['Location']))
 
-        # the coordinates of intersection
-        x = (b2-b1)/(m1-m2)
-        y = m1*x+b1
+    for i in range(nlocations):        
+        match = np.where(data['Location'] == locations[i])
+#        bikers[match] = pars[i+3]*(pars[0]*data['Temperature (BED)'][match] + pars[1]*data['Humidity (BED)'][match] + pars[2]*data['Precipitation (BED)'][match])
+        bikers[match] = pars[i+2]*(pars[0]*data['Temperature (BED)'][match] + pars[1]*data['Humidity (BED)'][match])
+#        bikers[match] = pars[i+2]*(pars[0]*data['Temperature (BED)'][match] + pars[1]*data['Precipitation (BED)'][match])
 
-    # must be closest to the segment, not the line
-    if x1 > x2: # can't assume x1 < x2
-        if x > x1: x = x1
-        if x < x2: x = x2
-    else:
-        if x < x1: x = x1
-        if x > x2: x = x2
-    if y1 > y2: # can't assume y1 < y2
-        if y > y1: y = y1
-        if y < y2: y = y2
-    else:
-        if y < y1: y = y1
-        if y > y2: y = y2
+        if plot:
+            fig = plt.figure()
+            ax = fig.add_subplot(111)
+            ax.set_xlabel("Date")
+            ax.set_ylabel("Bikers/minute")
+            ax.set_title(locations[i])
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+            ax.xaxis.set_ticks([datetime.datetime(2013,1,1),datetime.datetime(2014,1,1),datetime.datetime(2015,1,1),datetime.datetime(2016,1,1)])
+            ax.set_xlim([datetime.datetime(2013,1,1),datetime.datetime(2017,1,1)])
+            y_formatter = matplotlib.ticker.ScalarFormatter(useOffset=False)
+            ax.yaxis.set_major_formatter(y_formatter)
 
-    # closest approach is the distance from the perpendicular line
-    # angular separation in radians * r_earth = distance
-    r_earth = 6.3781e6
-    mindist = math.acos(math.sin(y0*math.pi/180.0)*math.sin(y*math.pi/180.0)+math.cos(y0*math.pi/180.0)*math.cos(y*math.pi/180.0)*math.cos((x0-x)*math.pi/180.0))*r_earth
+            # data corrected to 70F, 0% humid, 0" rain
+#            y = pars[i+3]*pars[0]*(70-data['Temperature (BED)'][match]) +\
+#                bikers[match] - data['Total Bike'][match]/data['Interval'][match]
+            y = pars[i+2]*pars[0]*(70-data['Temperature (BED)'][match]) +\
+                bikers[match] - data['Total Bike'][match]/data['Interval'][match]
+#            print y
+          
+            plt.plot(data['datetime'][match].astype(datetime.datetime), y, 'bo', label=locations[i])
+#            plt.plot(data['datetime'][match].astype(datetime.datetime), bikers[match], 'bo', label=locations[i])
+#            plt.plot(data['datetime'][match].astype(datetime.datetime), data['Total Bike'][match]/data['Interval'][match], 'ro', label=locations[i])
 
-    return mindist
-
-def plotEdges(edge_layer,lat=None,lon=None,radius=None, edgeids=None):
-
-    x = [] # Longitude (deg E)
-    y = [] # Latitude (deg N)
-
-    xclose = []
-    yclose = []
-    streetname = []
-    
-    idxx1 = edge_layer.fieldNameIndex('X1') 
-    idxx2 = edge_layer.fieldNameIndex('X2') 
-    idxy1 = edge_layer.fieldNameIndex('Y1') 
-    idxy2 = edge_layer.fieldNameIndex('Y2')
-
-    for feature in edge_layer.getFeatures():
-        x.append(feature[idxx1])
-        x.append(feature[idxx2])
-        x.append(None)
-        y.append(feature[idxy1])
-        y.append(feature[idxy2])
-        y.append(None)
-
-        
-        
-        if lat != None and lon != None:
-            if radius != None:
-                mindist = getMinDist(feature[idxx1],feature[idxy1],feature[idxx2],feature[idxy2],lon,lat)
-                if mindist <= radius:
-                    xclose.append(feature[idxx1])
-                    xclose.append(feature[idxx2])
-                    xclose.append(None)
-                    yclose.append(feature[idxy1])
-                    yclose.append(feature[idxy2])
-                    yclose.append(None)
-                    edgeid = feature[0]
-                    streetname = feature[2]
-        if feature[0] in edgeids:
-            xclose.append(feature[idxx1])
-            xclose.append(feature[idxx2])
-            xclose.append(None)
-            yclose.append(feature[idxy1])
-            yclose.append(feature[idxy2])
-            yclose.append(None)
-            streetname.append(feature[2])
+            plt.savefig(locations[i] + '.png')
+            plt.close()
+#            ipdb.set_trace()
             
 
-    lon = xclose[0]
-    lat = yclose[0]
-    fig = plt.figure()
-    ax = fig.add_subplot(111)
-    ax.set_xlabel("Longitude (deg E)")
-    ax.set_ylabel("Latitude (deg N)")
-
-    y_formatter = matplotlib.ticker.ScalarFormatter(useOffset=False)
-    ax.yaxis.set_major_formatter(y_formatter)
-    ax.xaxis.set_major_formatter(y_formatter)
-    size = 0.005
-#    ax.set_ylim([lat-size,lat+size])
-#    ax.set_xlim([lon-size,lon+size])
+    # negative bikers is unphysical
+    bad = np.where(bikers < 0)
+    if len(bad[0] > 0): return np.NINF
     
+    residuals = bikers - data['Total Bike']/data['Interval']
+
+    # Poisson Errors
+#    sigma = sqrt(bikers)/data['Interval']
+#    ivar = (1.0/sigma)**2
+    ivar = data['Interval']**2/bikers
+
+    loglike = -0.5*np.sum(ivar*residuals**2)
+#    if loglike > -20: ipdb.set_trace()
+
+    if math.isnan(loglike): ipdb.set_trace()
     
-    plt.plot(x, y)
-    plt.plot(xclose, yclose, 'r-')
-#    plt.plot(lon,lat,'ro')
-#    ax.annotate('E 79th St @ Park Ave (' + str(edgeid) + ')',xy=(lon+0.0001,lat))
-#    ax.annotate(streetname + '(' + str(edgeid) + ')',xy=(lon+0.0001,lat))
-    plt.savefig('edge.png')
+    return -0.5*np.sum(ivar*residuals**2)
 
-# supply path to qgis install location
-QgsApplication.setPrefixPath("C:/OSGeo4W64", True)
+# read the CSV file into a dictionary
+data = readcsv('count.csv')
 
-# create a reference to the QgsApplication, setting the
-# second argument to False disables the GUI
-#qgs = QgsApplication([], False)
-qgs = QgsApplication([], True)
+# convert date and time to datetime objects
+data['datetime'] = np.array([],dtype=np.datetime64)
+for date,time in zip(data['Date'],data['Time']):
+    data['datetime'] = np.append(data['datetime'], np.datetime64(datetime.datetime.strptime(date + ' ' + time,'%m/%d/%Y %H:%M')))
 
-# load providers
-qgs.initQgis()
+# define and convert the data types to numpy arrays
+datatypes = {
+    'Location':str,
+    'Weather':str,
+    'Counter':str,
+    'Notes':str,
+    'Latitude':float,
+    'Longitude':float,
+    'Female Ped':float,
+    'Male Ped':float,
+    'Total Ped':float,
+    'Female Bike':float,
+    'Male Bike':float,
+    'Total Bike':float,
+    'Female Other':float,
+    'Male Other':float,
+    'Total Other':float,
+    'Interval':float,
+    'Precipitation (BED)':float,
+    'Temperature (BED)':float,
+    'Humidity (BED)':float,
+    }
+for key in datatypes.keys():
+    array=[]
+    for value in data[key]:
+        if value=='':
+            value = np.nan
+        array.append(value)
+    data[key] = np.asarray(array,dtype=datatypes[key])
 
-# Write your code here to load some layers, use processing algorithms, etc.
-edge_layer = QgsVectorLayer("data/nyc_edges_ride/nyc_edges.shp", "NYC_Edges", "ogr")
-if not edge_layer.isValid():
-  print "edge layer failed to load!"
-else: QgsMapLayerRegistry.instance().addMapLayer(edge_layer)
-
-node_layer = QgsVectorLayer("data/nyc_edges_ride/nyc_edges_nodes.shp", "NYC_Nodes", "ogr")
-if not node_layer.isValid():
-  print "node layer failed to load!"
-else: QgsMapLayerRegistry.instance().addMapLayer(node_layer)
-
-poly_layer = QgsVectorLayer("data/nyc_edges_ride/nyc_edges_od_polygons.shp", "NYC_Polygons", "ogr")
-if not poly_layer.isValid():
-  print "polygon layer failed to load!"
-else: QgsMapLayerRegistry.instance().addMapLayer(poly_layer)  
-
-data_layer = QgsVectorLayer("data/nyc_edges_ride/nyc_edges_metro_street_data.dbf", "NYC_Data", "ogr")
-if not data_layer.isValid():
-  print "data layer failed to load!"
-else: QgsMapLayerRegistry.instance().addMapLayer(data_layer)  
-
-    
-                    
-    
+# The unique locations
+locations = list(set(data['Location']))
+locations.sort()
 
 
-#print getFieldNames(data_layer)
-#print getFieldNames(edge_layer)
+#ndim, nwalkers = len(locations)+3, 100
+ndim, nwalkers = len(locations)+2, 1000
+sampler = emcee.EnsembleSampler(nwalkers, ndim, bikelike, args=[data])
 
-# E 79th & Park Ave
-lat = 40.775578
-lon = -73.960339
+initpars = [0.0,0.0]
+for location in locations:
+    match = np.where(data['Location'] == location)
+    zeropt = np.sum(data['Total Bike'][match])/np.sum(data['Interval'][match])
+    initpars.append(zeropt)
+print initpars
 
-# Manhattan Bridge Bikepath
-#lat = 40.714629
-#lon = -73.994544
 
-#plotEdges(edge_layer, edgeid=1134166)# lat=lat, lon=lon, radius=2.5)
-#plotEdges(edge_layer, edgeid=803175)
-#plotEdges(edge_layer, edgeid=54068)
-#plotEdges(edge_layer, lat=lat, lon=lon, radius=2.5)
-plotEdges(edge_layer, edgeids=[1134166,803175,54068,54853])# lat=lat, lon=lon, radius=2.5)
+p0 = [np.random.rand(ndim)/1000 + initpars for i in range(nwalkers)]
 
-with open('weather.lga.csv','w') as weatherfile:
-    for i in range(8):
-        weather = getWeather(datetime.datetime(2015,7,13) + datetime.timedelta(days=float(i)),airport='LGA')
-#    ipdb.set_trace()
-        for time, temperature, humidity, precipitation in zip(weather['time'],weather['temperature'],weather['humidity'],weather['precipitation']):
-                if precipitation == 'N/A': precipitation = 0.0
-                weatherfile.write(str(time) + ',' + str(temperature) + ',' + str(humidity) + ',' + str(precipitation) + '\n')
-#ipdb.set_trace()
-    
 
-# grab the indices of relevant fields
-idxYear = data_layer.fieldNameIndex('YEAR')
-idxDay = data_layer.fieldNameIndex('DAY')
-idxHour = data_layer.fieldNameIndex('HOUR')
-idxMin = data_layer.fieldNameIndex('MINUTE')
-idxCommuters = data_layer.fieldNameIndex('COMMUTE_CO')
-idxEdge = data_layer.fieldNameIndex('EDGE_ID')
-idxx1 = edge_layer.fieldNameIndex('X1') 
-idxx2 = edge_layer.fieldNameIndex('X2') 
-idxy1 = edge_layer.fieldNameIndex('Y1') 
-idxy2 = edge_layer.fieldNameIndex('Y2')
+sampler.run_mcmc(p0, 10000)
 
-# create a dictionary of edges for later reference
-edges = {}
-for feature in edge_layer.getFeatures():
-    edges[feature[0]] = {'x':[feature[idxx1],feature[idxx2]],
-                         'y':[feature[idxy1],feature[idxy2]]}
+#labels = ['coeff_temp','coeff_humid','coeff_rain']
+labels = ['coeff_temp','coeff_humid']
+for location in locations:
+    labels.append("c_" + location)
 
-# make an animated gif of bicycle traffic
-#for i in range(0,24*7):
-for i in range(0,24*7*60):
-#    date1 = datetime.datetime(2015,7,13) + datetime.timedelta(hours=float(i))
-#    date2 = datetime.datetime(2015,7,13) + datetime.timedelta(hours=float(i)+1.0)
-    date1 = datetime.datetime(2015,7,13) + datetime.timedelta(minutes=float(i))
-    date2 = datetime.datetime(2015,7,13) + datetime.timedelta(minutes=float(i)+1.0)
-
-    fig = plt.figure()
-    ax = fig.add_subplot(111)
-    ax.set_xlabel("Longitude (deg E)")
-    ax.set_ylabel("Latitude (deg N)")
-    ax.set_title(str(date1))
-
-    y_formatter = matplotlib.ticker.ScalarFormatter(useOffset=False)
-    ax.yaxis.set_major_formatter(y_formatter)
-    ax.xaxis.set_major_formatter(y_formatter)
-    ax.set_ylim([40.67,40.90])
-    ax.set_xlim([-74.03,-73.90])
-    for feature in data_layer.getFeatures():
-        # convert strava time (local time) to datetime object 
-        date = datetime.datetime(feature[idxYear],1,1,feature[idxHour],feature[idxMin]) +\
-               datetime.timedelta(days=feature[idxDay]-1)
-        if date >= date1 and date < date2:
-            edgeid = feature[idxEdge]
-            x = edges[edgeid]['x']
-            y = edges[edgeid]['y']
-#            alpha = min([float(feature[idxCommuters])*0.1,1])
-            alpha = min([float(feature[idxCommuters])*0.3,1])
-            plt.plot(x, y, 'b-', alpha=alpha)
-
-    plt.savefig("minutegif/" + datetime.datetime.strftime(date1,'%Y-%m-%dT%H%M%S') + '.png') 
+samples = sampler.chain[:, 50:, :].reshape((-1, ndim))
+for i in range(ndim):
+    plt.figure()
+    plt.hist(samples[:,i], 100, color="k", histtype="step")
+    plt.title(labels[i])
+    plt.savefig("Dimension{0:d}".format(i) + '.png')
     plt.close()
+
+#ipdb.set_trace()
+
+maxlike = np.NINF
+
+for i in range(len(locations)):
+    '''
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Bikers/minute")
+    ax.set_title(locations[i])
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    ax.xaxis.set_ticks([datetime.datetime(2013,1,1),datetime.datetime(2014,1,1),datetime.datetime(2015,1,1),datetime.datetime(2016,1,1)])
+    ax.set_xlim([datetime.datetime(2013,1,1),datetime.datetime(2017,1,1)])
+    y_formatter = matplotlib.ticker.ScalarFormatter(useOffset=False)
+    ax.yaxis.set_major_formatter(y_formatter)
+    '''
     
+    match = np.where(data['Location'] == locations[i])
+
+    x = data['datetime'][match].astype(datetime.datetime)
+    for pars in samples[np.random.randint(len(samples), size=1000)]:
+        like = bikelike(pars,data)
+        print like, pars[0:2]
+        if like > maxlike:
+            maxlike = like
+            bestpars = pars
+
+        bikers = pars[i+2]*(pars[0]*data['Temperature (BED)'][match] + pars[1]*data['Humidity (BED)'][match])
+        #plt.plot(x, bikers, 'b-', label=location, alpha=0.01)
+
+    y = data['Total Bike'][match]/data['Interval'][match]
+#    plt.plot(x, y, 'bo', label=location)
+
+
+#    plt.savefig(locations[i] + '.png')
+#    plt.close()
+    
+
+#ipdb.set_trace()
+print bestpars
+bikelike(bestpars,data,plot=True)
 ipdb.set_trace()
-commuters = collections.OrderedDict()
+
+
+# make a triangle plot
+fig = corner.corner(samples, labels=labels)
+fig.savefig("triangle.png")
+
+
+ipdb.set_trace()
+
+
+#from matplotlib.font_manager import FontProperties
+#fontP = FontProperties()
+#fontP.set_size('small')
+zeropoints = np.zeros((len(locations),len(data['datetime'])),dtype=float)
+
 i=0
-bad = 0
-for i in range(24*7):
-    date = datetime.datetime(2015,7,13) + datetime.timedelta(hours=float(i))
-    commuters[str(date)] = 0
+for location in locations:
 
-for feature in data_layer.getFeatures():
-    # convert strava time (local time) to datetime object 
-    date = datetime.datetime(feature[idxYear],1,1,feature[idxHour],feature[idxMin]) +\
-           datetime.timedelta(days=feature[idxDay]-1)
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Bikers/minute")
+    ax.set_title(location)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    ax.xaxis.set_ticks([datetime.datetime(2013,1,1),datetime.datetime(2014,1,1),datetime.datetime(2015,1,1),datetime.datetime(2016,1,1)])
+    ax.set_xlim([datetime.datetime(2013,1,1),datetime.datetime(2017,1,1)])
+    y_formatter = matplotlib.ticker.ScalarFormatter(useOffset=False)
+    ax.yaxis.set_major_formatter(y_formatter)
 
-    datestr = str(datetime.datetime(feature[idxYear],1,1,feature[idxHour]) +\
-           datetime.timedelta(days=feature[idxDay]-1))
+    match = np.where(data['Location'] == location)
 
-    # filter out dates that aren't supposed to be in the sample (not complete)
-    if date >= datetime.datetime(2015,7,20): bad += 1
-    else:
-#        if feature[idxEdge] == 1134166: # Manhattan Bridge Bikepath
-#        if feature[idxEdge] == 54853: # Random spot
-#        if feature[idxEdge] == 803175: # spot with 43 total weekly commuters; roughly scales to busiest by total population
-        if feature[idxEdge] == 54068: # spot with 122 total weekly commuters; roughly scales to busiest by population density
-            commuters[datestr] += feature[idxCommuters]
-        
-#    print feature[idxEdge], date, feature[idxCommuters]
-#    if str(date) in commuters.keys(): commuters[str(date)] += feature[idxCommuters]
-#    else: commuters[str(date)] = feature[idxCommuters]
+    zeropoints[i][match] = 1.0
 
-    # print progress
+    pars1 = [2.98955584e-3,-1.93944467e-4,-1.96151944] # fitting just temp, humid, rain
+    pars1 = [0.00293953,-0.00151096,0.9622594] # fitting temp, humid, rain, and zeropoints for each location
+    pars1 = [0.00381207,-0.00133282] # fitting temp, humid, zeropoints
+
+    y = data['Total Bike'][match]/data['Interval'][match] +\
+        (70-data['Temperature (BED)'][match])*pars1[0] +\
+        (0-data['Humidity (BED)'][match])*pars1[1] #+\
+#        (0-data['Precipitation (BED)'][match])*pars1[2] 
+    
+  
+    plt.plot(data['datetime'][match].astype(datetime.datetime), y, 'bo', label=location)
+#    print data['datetime'][match], data['Total Bike'][match]/data['Interval'][match], location
+
+    plt.savefig(location + '.png')
+    plt.close()
+
     i += 1
-    if i % 10000 == 0: print float(i)#/float(nfeatures)
 
-with open('commuters.hour.4@E14.csv','w') as commuterfile:
-    for key in commuters.keys():
-        commuterfile.write(key + ',' + str(commuters[key]) + '\n')
+fig = plt.figure()
+ax = fig.add_subplot(111)
+ax.set_xlabel("Temperature (BED)")
+ax.set_ylabel("Bikers/minute")
+y_formatter = matplotlib.ticker.ScalarFormatter(useOffset=False)
+ax.yaxis.set_major_formatter(y_formatter)
+plt.plot(data['Temperature (BED)'],data['Total Bike']/data['Interval'],'bo')
+plt.savefig('countvtemp.png')
+plt.close()
 
-ipdb.set_trace()
+fig = plt.figure()
+ax = fig.add_subplot(111)
+ax.set_xlabel("Humidity (BED)")
+ax.set_ylabel("Bikers/minute")
+y_formatter = matplotlib.ticker.ScalarFormatter(useOffset=False)
+ax.yaxis.set_major_formatter(y_formatter)
+plt.plot(data['Humidity (BED)'],data['Total Bike']/data['Interval'],'bo')
+plt.savefig('countvhumidity.png')
+plt.close()
 
-edgeCommuters = collections.OrderedDict()
-for feature in edge_layer.getFeatures():
-    edgeCommuters[feature[0]] = 0
+fig = plt.figure()
+ax = fig.add_subplot(111)
+ax.set_xlabel("Precipitation (BED)")
+ax.set_ylabel("Bikers/minute")
+y_formatter = matplotlib.ticker.ScalarFormatter(useOffset=False)
+ax.yaxis.set_major_formatter(y_formatter)
+plt.plot(data['Precipitation (BED)'],data['Total Bike']/data['Interval'],'bo')
+plt.savefig('countvrain.png')
+plt.close()
 
-for feature in data_layer.getFeatures():
-    edgeCommuters[feature[0]] += feature[idxCommuters]
-
-with open('edgecommuters.csv','w') as commuterfile:
-    for key in edgeCommuters.keys():
-        commuterfile.write(str(key) + ',' + str(edgeCommuters[key]) + '\n')
 
 
-#weather = getWeather(datetime.datetime(2015,7,13), airport='JFK')
-#print bad
-ipdb.set_trace()
 
-# When your script is complete, call exitQgis() to remove the provider and
-# layer registries from memory
-qgs.exitQgis()
+
+temp = data['Temperature (BED)']
+humid = data['Humidity (BED)']
+rain = data['Precipitation (BED)']
+time = data['datetime']
+
+
+
+A = np.vstack([temp, humid, rain, zeropoints]).T
+
+A = np.vstack([temp, humid, zeropoints]).T
+#lt alt,az,cosrot,sinrot,temp,np.ones(len(x))]).T
+
+y = data['Total Bike']/data['Interval']
+pars = np.linalg.lstsq(A,y)[0]
+
+model = np.dot(A,pars)
+
+
+
+residuals = y-model
+
+
+npars = 2
+nxplots = 1
+nyplots = npars
+fig = plt.figure(figsize=(15, 12))
+ax = fig.add_subplot(nyplots,nxplots,1)
+
+labels = ['Temperature', 'Humidity','Rain']
+for location in locations: labels.append(location)
+           
+for i in range(npars):
+
+    ax = fig.add_subplot(nyplots,nxplots,i)
+    sub = residuals + pars[i]*A[:,i]
+    ax.scatter(A[:,i], sub)
+    ax.plot(A[:,i], pars[i]*A[:,i],color='r')
+    ax.set_xlabel(labels[i])
+    ax.set_ylabel("Bikes/minute")
+
+fig.savefig("corrected_count.png")
+print pars
+ipdb.set_trace()               
+#plt.legend(prop=fontP)
+
+#legend([plot1], "title", prop = fontP)
 
     

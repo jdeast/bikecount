@@ -1,17 +1,35 @@
+import matplotlib
+matplotlib.use('Agg') # Workaround for Tkinter import error
 import matplotlib.pyplot as plt
 import json
 import csv
 import datetime
 import ipdb
+from qgis.core import *
 
 with open('x.dat') as xfile:
     x = json.load(xfile)
 with open('y.dat') as yfile:
     y = json.load(yfile)
 
+fig = plt.figure()
+
+ax = fig.add_subplot(111, aspect='equal')
+ax.set_xlabel("Longitude (deg E)")
+ax.set_ylabel("Latitude (deg N)")
+
+y_formatter = matplotlib.ticker.ScalarFormatter(useOffset=False)
+ax.yaxis.set_major_formatter(y_formatter)
+ax.xaxis.set_major_formatter(y_formatter)
+ax.set_ylim([40.67,40.90])
+ax.set_xlim([-74.03,-73.90])
+ax.set_xticks([-74,-73.95,-73.9])
+
 plt.plot(x,y)
 plt.savefig('edge.png')
 plt.show()
+
+ipdb.set_trace()
 
 fig = plt.figure()
 ax=fig.add_subplot(111)
